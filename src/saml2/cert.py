@@ -4,16 +4,74 @@ import base64
 from os import remove
 from os.path import join
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 
-from OpenSSL import crypto
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes as _hashes
+from cryptography.hazmat.primitives import serialization as _serialization
 from cryptography.hazmat.primitives.asymmetric import ec as _ec
 from cryptography.hazmat.primitives.asymmetric import padding as _padding
 from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
 import cryptography.x509 as _x509
 
 import saml2.cryptography.pki
+
+
+# pyOpenSSL took an OpenSSL digest *name*; cryptography takes an instance. Only the
+# algorithms OpenSSL would actually have accepted for a certificate signature are
+# offered, and an unknown one is rejected rather than silently defaulted — the digest
+# is part of what the signature means.
+_HASH_ALGORITHMS = {
+    "sha1": _hashes.SHA1,
+    "sha224": _hashes.SHA224,
+    "sha256": _hashes.SHA256,
+    "sha384": _hashes.SHA384,
+    "sha512": _hashes.SHA512,
+}
+
+# Attribute order matches the C/ST/L/O/OU/CN sequence the pyOpenSSL implementation
+# built by assignment, so an existing caller's certificates keep the same subject DN.
+_SUBJECT_FIELDS = (
+    ("country_code", _x509.NameOID.COUNTRY_NAME),
+    ("state", _x509.NameOID.STATE_OR_PROVINCE_NAME),
+    ("city", _x509.NameOID.LOCALITY_NAME),
+    ("organization", _x509.NameOID.ORGANIZATION_NAME),
+    ("organization_unit", _x509.NameOID.ORGANIZATIONAL_UNIT_NAME),
+)
+
+
+def _as_bytes(value):
+    """PEM data reaches this module as `str` or `bytes` depending on the caller.
+
+    `create_certificate` returns bytes, `create_cert_signed_certificate` returns str,
+    and `read_str_from_file` returns bytes — so every loader here has always had to
+    take both. pyOpenSSL's loaders did the coercion internally; cryptography's do not.
+    """
+    if value is None or isinstance(value, bytes):
+        return value
+    return value.encode("utf-8")
+
+
+def _hash_algorithm(hash_alg):
+    algorithm = _HASH_ALGORITHMS.get(str(hash_alg).lower().replace("-", "").replace("_", ""))
+    if algorithm is None:
+        raise WrongInput(f"Unsupported hash algorithm: {hash_alg!r}")
+    return algorithm()
+
+
+def _subject_name(cert_info, cn):
+    if len(cert_info["country_code"]) != 2:
+        raise WrongInput("Country code must be two letters!")
+    attributes = [_x509.NameAttribute(oid, cert_info[key]) for key, oid in _SUBJECT_FIELDS]
+    attributes.append(_x509.NameAttribute(_x509.NameOID.COMMON_NAME, cn))
+    return _x509.Name(attributes)
+
+
+def _validity_window(valid_from, valid_to):
+    """`gmtime_adj_notBefore` / `gmtime_adj_notAfter` semantics: seconds from now."""
+    now = datetime.now(timezone.utc)
+    return now + timedelta(seconds=valid_from), now + timedelta(seconds=valid_to)
 
 
 class WrongInput(Exception):
@@ -135,44 +193,51 @@ class OpenSSLWrapper:
             k_f = join(cert_dir, key_file)
 
         # create a key pair
-        k = crypto.PKey()
-        k.generate_key(crypto.TYPE_RSA, key_length)
+        k = _rsa.generate_private_key(public_exponent=65537, key_size=key_length)
 
-        # create a self-signed cert
-        cert = crypto.X509()
-
+        subject = _subject_name(cert_info, cn)
         if request:
-            cert = crypto.X509Req()
-
-        if len(cert_info["country_code"]) != 2:
-            raise WrongInput("Country code must be two letters!")
-        cert.get_subject().C = cert_info["country_code"]
-        cert.get_subject().ST = cert_info["state"]
-        cert.get_subject().L = cert_info["city"]
-        cert.get_subject().O = cert_info["organization"]  # noqa: E741
-        cert.get_subject().OU = cert_info["organization_unit"]
-        cert.get_subject().CN = cn
-        if not request:
-            cert.set_serial_number(sn)
-            cert.gmtime_adj_notBefore(valid_from)  # Valid before present time
-            cert.gmtime_adj_notAfter(valid_to)  # 3 650 days
-            cert.set_issuer(cert.get_subject())
-        cert.set_pubkey(k)
-        cert.sign(k, hash_alg)
+            builder = _x509.CertificateSigningRequestBuilder().subject_name(subject)
+        else:
+            # a self-signed cert
+            not_before, not_after = _validity_window(valid_from, valid_to)
+            builder = (
+                _x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(subject)
+                .public_key(k.public_key())
+                .serial_number(sn)
+                .not_valid_before(not_before)
+                .not_valid_after(not_after)
+            )
+        cert = builder.sign(k, _hash_algorithm(hash_alg))
 
         try:
-            if request:
-                tmp_cert = crypto.dump_certificate_request(crypto.FILETYPE_PEM, cert)
-            else:
-                tmp_cert = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
+            tmp_cert = cert.public_bytes(_serialization.Encoding.PEM)
             tmp_key = None
             if cipher_passphrase is not None:
                 passphrase = cipher_passphrase["passphrase"]
                 if isinstance(cipher_passphrase["passphrase"], str):
                     passphrase = passphrase.encode("utf-8")
-                tmp_key = crypto.dump_privatekey(crypto.FILETYPE_PEM, k, cipher_passphrase["cipher"], passphrase)
+                # NOTE: `cipher_passphrase["cipher"]` is no longer honoured. pyOpenSSL
+                # took an OpenSSL cipher name here; cryptography exposes no way to
+                # choose the PEM encryption cipher, only `BestAvailableEncryption`.
+                # The passphrase still applies and the output is still a PKCS#8
+                # "ENCRYPTED PRIVATE KEY", so callers and `create_cert_signed_certificate`
+                # are unaffected — but a caller asking for a specific legacy cipher now
+                # gets AES-256-CBC instead. The documented example, "blowfish", is not
+                # even reachable in OpenSSL 3's default provider, so nothing that worked
+                # stops working.
+                encryption = _serialization.BestAvailableEncryption(passphrase)
             else:
-                tmp_key = crypto.dump_privatekey(crypto.FILETYPE_PEM, k)
+                encryption = _serialization.NoEncryption()
+            tmp_key = k.private_bytes(
+                _serialization.Encoding.PEM,
+                # PKCS#8, matching what `dump_privatekey(FILETYPE_PEM, ...)` emitted
+                # against OpenSSL 3: "BEGIN PRIVATE KEY" / "BEGIN ENCRYPTED PRIVATE KEY".
+                _serialization.PrivateFormat.PKCS8,
+                encryption,
+            )
             if write_to_file:
                 with open(c_f, "w") as fc:
                     fc.write(tmp_cert.decode("utf-8"))
@@ -241,27 +306,26 @@ class OpenSSLWrapper:
         :return:                  String representation of the signed
                                   certificate.
         """
-        ca_cert = crypto.load_certificate(crypto.FILETYPE_PEM, sign_cert_str)
-        ca_key = None
-        if passphrase is not None:
-            ca_key = crypto.load_privatekey(crypto.FILETYPE_PEM, sign_key_str, passphrase)
-        else:
-            ca_key = crypto.load_privatekey(crypto.FILETYPE_PEM, sign_key_str)
-        req_cert = crypto.load_certificate_request(crypto.FILETYPE_PEM, request_cert_str)
+        ca_cert = _x509.load_pem_x509_certificate(_as_bytes(sign_cert_str))
+        # `load_pem_private_key` takes password=None for an unencrypted key, so the
+        # two pyOpenSSL call shapes collapse into one. A wrong passphrase raises
+        # ValueError here, as `load_privatekey` raised crypto.Error before.
+        ca_key = _serialization.load_pem_private_key(_as_bytes(sign_key_str), password=_as_bytes(passphrase))
+        req_cert = _x509.load_pem_x509_csr(_as_bytes(request_cert_str))
 
-        cert = crypto.X509()
-        cert.set_subject(req_cert.get_subject())
-        cert.set_serial_number(sn)
-        cert.gmtime_adj_notBefore(valid_from)
-        cert.gmtime_adj_notAfter(valid_to)
-        cert.set_issuer(ca_cert.get_subject())
-        cert.set_pubkey(req_cert.get_pubkey())
-        cert.sign(ca_key, hash_alg)
+        not_before, not_after = _validity_window(valid_from, valid_to)
+        cert = (
+            _x509.CertificateBuilder()
+            .subject_name(req_cert.subject)
+            .issuer_name(ca_cert.subject)
+            .public_key(req_cert.public_key())
+            .serial_number(sn)
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+            .sign(ca_key, _hash_algorithm(hash_alg))
+        )
 
-        cert_dump = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
-        if isinstance(cert_dump, str):
-            return cert_dump
-        return cert_dump.decode("utf-8")
+        return cert.public_bytes(_serialization.Encoding.PEM).decode("utf-8")
 
     def verify_chain(self, cert_chain_str_list, cert_str):
         """

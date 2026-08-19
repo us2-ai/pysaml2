@@ -1,6 +1,25 @@
 # Changelog
 
 
+## Unreleased (us2-ai fork)
+
+- fix: Migrate the remaining `OpenSSL.crypto` uses to pyca/cryptography.
+  `OpenSSLWrapper.create_certificate`, `OpenSSLWrapper.create_cert_signed_certificate`
+  and `sigver.active_cert` were still on pyOpenSSL's X509 API. `X509Req`,
+  `dump_certificate_request` and `load_certificate_request` are **removed** in
+  pyOpenSSL 26, which broke certificate generation outright; the rest were deprecated
+  and on the same schedule. `active_cert` catches only `AttributeError` and returns
+  `False`, so their removal would have made every metadata certificate read as
+  inactive with no error raised.
+- deps: Remove the `pyopenssl` dependency — nothing under `src/` imports `OpenSSL`
+  any more.
+- BREAKING (minor): `create_certificate`'s `cipher_passphrase["cipher"]` is no longer
+  honoured. cryptography exposes no way to select the PEM encryption cipher, so the
+  passphrase is applied with `BestAvailableEncryption` (AES-256-CBC). Output is still
+  a PKCS#8 `ENCRYPTED PRIVATE KEY` readable with the same passphrase. The documented
+  example value, `blowfish`, is not reachable in OpenSSL 3's default provider anyway.
+
+
 ## v7.5.4 (2025-10-07)
 
 - Minor refactor to handle `shelve.open` and `dbm` errors
